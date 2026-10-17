@@ -1,12 +1,63 @@
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import crypto from "crypto";
 import dbConnect from "../../../../lib/dbconnect";
 import AIUser from "../../../../models/User";
+import SubscribedRepos from "../../../../models/SubscribedRepo";
+import ReviewLog from "../../../../models/ReviewLog";
 import OpenAI from "openai";
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
 });
+
+function shouldReviewFile(filename) {
+    if (!filename || typeof filename !== "string") return false;
+    const lower = filename.toLowerCase();
+
+    // Ignore dependency lockfiles
+    if (
+        lower.endsWith("package-lock.json") ||
+        lower.endsWith("yarn.lock") ||
+        lower.endsWith("pnpm-lock.yaml") ||
+        lower.endsWith("bun.lockb") ||
+        lower.endsWith("bun.lock") ||
+        lower.endsWith("composer.lock") ||
+        lower.endsWith("cargo.lock") ||
+        lower.endsWith("gemfile.lock") ||
+        lower.endsWith("poetry.lock")
+    ) {
+        return false;
+    }
+
+    // Ignore minified / sourcemap files
+    if (lower.endsWith(".min.js") || lower.endsWith(".min.css") || lower.endsWith(".map")) {
+        return false;
+    }
+
+    // Ignore binary / media assets
+    const binaryExtensions = [
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
+        ".pdf", ".woff", ".woff2", ".ttf", ".eot", ".otf",
+        ".mp4", ".webm", ".mp3", ".wav", ".zip", ".tar", ".gz"
+    ];
+    if (binaryExtensions.some((ext) => lower.endsWith(ext))) {
+        return false;
+    }
+
+    // Ignore build output artifacts
+    if (
+        lower.startsWith("dist/") ||
+        lower.startsWith("build/") ||
+        lower.startsWith(".next/") ||
+        lower.startsWith("node_modules/") ||
+        lower.startsWith("out/") ||
+        lower.startsWith(".turbo/")
+    ) {
+        return false;
+    }
+
+    return true;
+}
 
 export async function POST(req) {
     try {
@@ -42,7 +93,6 @@ export async function POST(req) {
         }
 
         const action = body.action;
-
         if (!["opened", "reopened", "synchronize"].includes(action)) {
             return NextResponse.json({ ignored: true, action });
         }
@@ -52,118 +102,122 @@ export async function POST(req) {
         const pullNumber = body.pull_request.number;
         const headSha = body.pull_request.head.sha;
         const isPrivate = body.repository.private;
+        const pullTitle = body.pull_request.title || "Untitled Pull Request";
+        const pullUrl = body.pull_request.html_url;
 
         await dbConnect();
 
-        const user = await AIUser.findOne({ githubUsername: owner });
-        const accessToken = user?.githubAccessToken;
+        // 1. Resolve access token & user: First check SubscribedRepos, then AIUser
+        let user = null;
+        let accessToken = null;
+
+        const subscription = await SubscribedRepos.findOne({
+            $or: [
+                { repoName: repo },
+                { repoName: `${owner}/${repo}` },
+                { repoId: String(body.repository.id) },
+                { repoUrl: body.repository.html_url },
+            ]
+        }).populate("owner");
+
+        if (subscription?.owner?.githubAccessToken) {
+            user = subscription.owner;
+            accessToken = subscription.owner.githubAccessToken;
+        }
+
+        if (!accessToken) {
+            const directUser = await AIUser.findOne({ githubUsername: owner });
+            if (directUser) {
+                user = directUser;
+                accessToken = directUser.githubAccessToken;
+            }
+        }
+
+        if (!accessToken && process.env.GITHUB_ACCESS_TOKEN) {
+            accessToken = process.env.GITHUB_ACCESS_TOKEN;
+        }
 
         if (isPrivate && !accessToken) {
             console.error(`Private repository PR received for ${owner}/${repo}, but no access token was found.`);
             return NextResponse.json(
-                { error: `No access token found for ${owner}. Connect GitHub first or configure GITHUB_ACCESS_TOKEN.` },
+                { error: `No access token found for ${owner}. Connect GitHub first.` },
                 { status: 401 }
             );
         }
 
-        const headers = {
-            Accept: "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        };
+        // Run the heavy OpenAI code review & comment posting in the background via Next.js after()
+        after(async () => {
+            try {
+                console.log(`Starting background AI code review for ${owner}/${repo} #${pullNumber}...`);
 
-        if (accessToken) {
-            headers["Authorization"] = `Bearer ${accessToken}`;
-        }
+                const headers = {
+                    Accept: "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+                };
 
-        const baseUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}`;
+                const baseUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}`;
 
-        const diffResponse = await fetch(baseUrl, {
-            headers: {
-                ...headers,
-                Accept: "application/vnd.github.diff",
-            },
-            cache: "no-store",
-        });
+                const filesResponse = await fetch(`${baseUrl}/files?per_page=100`, {
+                    headers,
+                    cache: "no-store",
+                });
 
-        if (!diffResponse.ok) {
-            console.error("Failed to fetch PR diff:", await diffResponse.text());
-            return NextResponse.json(
-                { error: "Failed to fetch PR diff from GitHub" },
-                { status: 502 }
-            );
-        }
-
-        const diff = await diffResponse.text();
-
-        const filesResponse = await fetch(`${baseUrl}/files?per_page=100`, {
-            headers,
-            cache: "no-store",
-        });
-
-        if (!filesResponse.ok) {
-            console.error("Failed to fetch changed files:", await filesResponse.text());
-            return NextResponse.json(
-                { error: "Failed to fetch changed files from GitHub" },
-                { status: 502 }
-            );
-        }
-
-        const files = await filesResponse.json();
-
-        const filesWithPatchesAndCode = await Promise.all(
-            files.map(async (file) => {
-                let code = null;
-
-                if (file.status !== "removed" && file.patch) {
-                    try {
-                        const fileContentResponse = await fetch(
-                            `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(file.filename)}?ref=${headSha}`,
-                            {
-                                headers: {
-                                    ...headers,
-                                    Accept: "application/vnd.github.raw+json",
-                                },
-                                cache: "no-store",
-                            }
-                        );
-
-                        if (fileContentResponse.ok) {
-                            code = await fileContentResponse.text();
-                        }
-                    } catch (err) {
-                        console.warn(`Could not fetch full source code for ${file.filename}:`, err.message);
-                    }
+                if (!filesResponse.ok) {
+                    console.error("Failed to fetch changed files:", await filesResponse.text());
+                    return;
                 }
 
-                return {
-                    filename: file.filename,
-                    status: file.status, 
-                    additions: file.additions,
-                    deletions: file.deletions,
-                    changes: file.changes,
-                    patch: file.patch || null, 
-                    code, 
-                    rawUrl: file.raw_url,
-                    blobUrl: file.blob_url,
-                };
-            })
-        );
+                const allFiles = await filesResponse.json();
+                const reviewableFiles = Array.isArray(allFiles)
+                    ? allFiles.filter((f) => shouldReviewFile(f.filename))
+                    : [];
 
-        console.log("Processed Pull Request:", {
-            action,
-            repository: `${owner}/${repo}`,
-            pullNumber,
-            title: body.pull_request.title,
-            headSha,
-            changedFilesCount: filesWithPatchesAndCode.length,
-            // filesWithPatchesAndCode
-        });
+                if (reviewableFiles.length === 0) {
+                    console.log(`No reviewable code files found for ${owner}/${repo} #${pullNumber}. Skipping review.`);
+                    return;
+                }
 
-        let reviewComment = null;
-        let commentUrl = null;
+                // Limit review to the first 15 files to maintain concise, high-value prompt
+                const filesToAnalyze = reviewableFiles.slice(0, 15);
 
-        
-            try {
+                const filesWithPatchesAndCode = await Promise.all(
+                    filesToAnalyze.map(async (file) => {
+                        let code = null;
+
+                        if (file.status !== "removed" && file.patch) {
+                            try {
+                                const fileContentResponse = await fetch(
+                                    `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(file.filename)}?ref=${headSha}`,
+                                    {
+                                        headers: {
+                                            ...headers,
+                                            Accept: "application/vnd.github.raw+json",
+                                        },
+                                        cache: "no-store",
+                                    }
+                                );
+
+                                if (fileContentResponse.ok) {
+                                    code = await fileContentResponse.text();
+                                }
+                            } catch (err) {
+                                console.warn(`Could not fetch full source code for ${file.filename}:`, err.message);
+                            }
+                        }
+
+                        return {
+                            filename: file.filename,
+                            status: file.status,
+                            additions: file.additions,
+                            deletions: file.deletions,
+                            changes: file.changes,
+                            patch: file.patch || null,
+                            code,
+                        };
+                    })
+                );
+
                 const formattedFiles = filesWithPatchesAndCode
                     .map((file) => {
                         let text = `### File: ${file.filename} (${file.status})\n`;
@@ -184,7 +238,7 @@ export async function POST(req) {
                 const prompt = `
 You are an expert AI code reviewer. Conduct a detailed, professional code review for the following GitHub Pull Request.
 
-Pull Request Title: ${body.pull_request.title}
+Pull Request Title: ${pullTitle}
 Pull Request Description: ${body.pull_request.body || "No description provided"}
 Repository: ${owner}/${repo}
 Branch: ${body.pull_request.head.ref} -> ${body.pull_request.base.ref}
@@ -204,8 +258,9 @@ You MUST structure your response strictly into the following 3 sections using cl
 - Provide actionable suggestions, clean code improvements, best practices, or refactored code snippets to enhance code quality.
 `;
 
+                const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
                 const completion = await openai.chat.completions.create({
-                    model: process.env.OPENAI_MODEL || "gpt-5.4-mini",
+                    model,
                     messages: [
                         {
                             role: "system",
@@ -220,7 +275,8 @@ You MUST structure your response strictly into the following 3 sections using cl
                     temperature: 0.2,
                 });
 
-                reviewComment = completion.choices[0]?.message?.content;
+                const reviewComment = completion.choices[0]?.message?.content;
+                let commentUrl = null;
 
                 if (reviewComment && accessToken) {
                     const commentResponse = await fetch(
@@ -247,28 +303,40 @@ You MUST structure your response strictly into the following 3 sections using cl
                         console.error("Failed to post comment to GitHub PR:", await commentResponse.text());
                     }
                 }
-            } catch (aiError) {
-                console.error("Error during AI review or GitHub commenting:", aiError);
-            }
 
-        return NextResponse.json({
-            success: true,
-            pullRequest: {
-                number: pullNumber,
-                title: body.pull_request.title,
-                body: body.pull_request.body,
-                author: body.pull_request.user?.login,
-                baseBranch: body.pull_request.base.ref,
-                headBranch: body.pull_request.head.ref,
-                headSha,
-            },
-            reviewPosted: !!commentUrl,
-            commentUrl,
-            reviewComment,
-            diff,
-            files: filesWithPatchesAndCode,
+                // Record review execution in ReviewLog
+                await ReviewLog.create({
+                    repoName: `${owner}/${repo}`,
+                    ownerLogin: owner,
+                    pullNumber,
+                    pullTitle,
+                    pullUrl,
+                    commentUrl: commentUrl || "",
+                    filesCount: filesToAnalyze.length,
+                    modelUsed: model,
+                    reviewComment: reviewComment || "",
+                    owner: user?._id || null,
+                });
+
+                console.log(`Saved review log for ${owner}/${repo} #${pullNumber}.`);
+            } catch (bgError) {
+                console.error("Background code review error:", bgError);
+            }
         });
 
+        // Immediately respond to GitHub within <200ms to eliminate 10s timeout failures
+        return NextResponse.json(
+            {
+                success: true,
+                message: "Pull request review scheduled in background",
+                pullRequest: {
+                    number: pullNumber,
+                    title: pullTitle,
+                    repository: `${owner}/${repo}`,
+                },
+            },
+            { status: 202 }
+        );
     } catch (error) {
         console.error("Webhook processing error:", error);
         return NextResponse.json(
