@@ -4,6 +4,7 @@ import dbConnect from "../../../../lib/dbconnect";
 import AIUser from "../../../../models/User";
 import ReviewLog from "../../../../models/ReviewLog";
 
+
 export async function GET() {
     try {
         const cookieStore = await cookies();
@@ -38,6 +39,9 @@ export async function GET() {
             reviews,
         });
     } catch (error) {
+        if (error?.digest?.startsWith("NEXT_") || error?.digest === "HANGING_PROMISE_REJECTION") {
+            throw error;
+        }
         console.error("Error fetching review history:", error);
         return NextResponse.json(
             { success: false, error: "Failed to fetch review history" },

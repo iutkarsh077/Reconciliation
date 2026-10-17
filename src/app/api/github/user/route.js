@@ -4,6 +4,7 @@ import dbConnect from "../../../../lib/dbconnect";
 import AIUser from "../../../../models/User";
 import axios from "axios";
 
+
 export async function GET() {
     try {
         const cookieStore = await cookies();
@@ -56,6 +57,9 @@ export async function GET() {
             );
         }
     } catch (error) {
+        if (error?.digest?.startsWith("NEXT_") || error?.digest === "HANGING_PROMISE_REJECTION") {
+            throw error;
+        }
         console.error("Error fetching user profile:", error);
         return NextResponse.json(
             { error: "Failed to fetch user profile" },

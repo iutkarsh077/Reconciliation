@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import dbConnect from "../../../../lib/dbconnect";
 import AIUser from "../../../../models/User";
 
+
 export async function GET(request) {
     try {
         const { searchParams } = new URL(request.url);
@@ -111,6 +112,9 @@ export async function GET(request) {
 
         return response;
     } catch (error) {
+        if (error?.digest?.startsWith("NEXT_") || error?.digest === "HANGING_PROMISE_REJECTION") {
+            throw error;
+        }
         console.log("dbc onnection: ", error);
         return NextResponse.json({ message: "Internal Server error", statusText: false }, { status: 500 })
     }

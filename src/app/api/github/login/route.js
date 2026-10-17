@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { randomBytes } from "node:crypto";
 
+
 export async function GET() {
     try {
         const clientId = process.env.GITHUB_CLIENT_ID;
@@ -27,6 +28,9 @@ export async function GET() {
         return response;
 
     } catch (error) {
+        if (error?.digest?.startsWith("NEXT_") || error?.digest === "HANGING_PROMISE_REJECTION") {
+            throw error;
+        }
         console.log(error)
         return NextResponse.json({ message: "Internal Server error", statusText: false }, { status: 500 })
     }
