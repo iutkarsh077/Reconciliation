@@ -6,6 +6,9 @@ Automated code review system for GitHub pull requests powered by Next.js, MongoD
   <img src="https://res.cloudinary.com/dakddv1pm/image/upload/v1792238919/posts/bwfcjiynxhfvnkqmkggy.png" alt="AI Code Review" width="100%" />
 </p>
 
+
+
+
 This project follows the **ASD-STE100** (Simplified Technical English) documentation standard to ensure clear, simple, and unambiguous instructions.
 
 ---
